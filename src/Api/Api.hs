@@ -4,8 +4,14 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE InstanceSigs #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE UndecidableInstances #-}
 
-module Api.Api (runApi) where
+module Api.Api (runApi, swaggerDoc) where
 
 import Control.Monad.Except
 import Control.Monad.Reader
@@ -19,79 +25,86 @@ import Network.Wai.Handler.Warp
 import Ranker
 import Servant
 import Servant.Swagger
-import Servant.Swagger.UI
 import Store
 import System.IO
 import Types
+import Servant.API.Generic
+import Servant.Server.Generic (AsServerT, genericServeT)
 
 type AppHandler = ReaderT Env Handler
 
 -- * api
 
-data TeamReqest = TeamReqest {playerId1 :: Int, playerId2 :: Int}
+data DoublesRequest = DoublesRequest {playerId1 :: Int, playerId2 :: Int, playerId3 :: Int, playerId4 :: Int}
   deriving (Show, Eq, Generic)
 
-data StartMatchRequest
-  = SinglesRequest {pid1 :: Int, pid2 :: Int}
-  | DoublesRequest {dteam1 :: TeamReqest, dteam2 :: TeamReqest}
-  | MixedRequest {mteam1 :: TeamReqest, mteam2 :: TeamReqest}
+data MixedRequest = MixedRequest {playerId1 :: Int, playerId2 :: Int, playerId3 :: Int, playerId4 :: Int}
   deriving (Show, Eq, Generic)
 
-type RestApi =
-  "players" :> Get '[JSON] [Player]
-    :<|> "startMatch" :> ReqBody '[JSON] StartMatchRequest :> Post '[JSON] ReadyMatch
+data SinglesRequest = SinglesRequest {playerId1 :: Int, playerId2 :: Int}
+  deriving (Show, Eq, Generic)
 
-proxyApi :: Proxy Api
-proxyApi = Proxy
-
-type Api =
-  SwaggerSchemaUI "swagger-ui" "swagger.json"
-    :<|> RestApi
+data Api route = Api {
+  _players :: route :- "players" :> Get '[JSON] [Player],
+  _singleStart :: route :- "single" :> "start" :> ReqBody '[JSON] SinglesRequest :> Post '[JSON] ReadyMatch,
+  _doubleStart :: route :- "double" :> "start" :> ReqBody '[JSON] DoublesRequest :> Post '[JSON] ReadyMatch,
+  _mixedStart :: route :- "mixed" :> "start" :> ReqBody '[JSON] MixedRequest :> Post '[JSON] ReadyMatch
+} deriving (Generic)
+  
+--instance HasSwagger (ToServantApi routes) => HasSwagger (NamedRoutes routes) where
+--  toSwagger _ = toSwagger (Proxy :: Proxy (ToServantApi routes))
 
 -- * app
 
 runApi :: IO ()
 runApi = do
-  let port = 3000
+  let p = 3000
       settings =
-        setPort port $
+        setPort p $
           setBeforeMainLoop
-            (hPutStrLn stderr ("listening on port " ++ show port))
+            (hPutStrLn stderr ("listening on port " ++ show p))
             defaultSettings
-  runSettings settings =<< mkApp
+  runSettings settings mkApp
 
-mkApp :: IO Application
-mkApp = return $ serve proxyApi server
+recordRoute :: Api (AsServerT AppHandler)
+recordRoute = Api {
+  _players = getPlayers,
+  _singleStart = singleStart,
+  _doubleStart = doubleStart,
+  _mixedStart = mixedStart
+}
 
-server :: Server Api
-server = hoistServer (Proxy :: Proxy Api) (`runReaderT` env) api :: Server Api
-
-api :: ServerT Api AppHandler
-api =
-  swaggerSchemaUIServerT swaggerDoc
-    :<|> getPlayers
-    :<|> startMatch
+mkApp :: Application
+mkApp = genericServeT (`runReaderT` env) recordRoute
 
 getPlayers :: AppHandler [Player]
 getPlayers = inPipe $ readAllPlayers (ClubId "Vejlby IK")
 
-startMatch :: StartMatchRequest -> AppHandler ReadyMatch
-startMatch request = do
-  ps <- inPipe (readPlayers getPlayersFromRequest)
+singleStart :: SinglesRequest -> AppHandler ReadyMatch
+singleStart (SinglesRequest p1 p2) = 
+  startMatch [p1, p2] $
+    \case
+      [x1, x2] -> pure $ Singles x1 x2
+      _ -> throwError err400
+
+doubleStart :: DoublesRequest -> AppHandler ReadyMatch
+doubleStart (DoublesRequest p1 p2 p3 p4) = startMatch [p1, p2, p3, p4] $ 
+  \ case 
+    [x1, x2, x3, x4] -> pure $ Doubles (x1, x2) (x3, x4)
+    _ -> throwError err400
+
+mixedStart :: MixedRequest -> AppHandler ReadyMatch
+mixedStart (MixedRequest p1 p2 p3 p4) = startMatch [p1, p2, p3, p4] $ 
+  \ case 
+    [x1, x2, x3, x4] -> pure $ Mixed (x1, x2) (x3, x4)
+    _ -> throwError err400
+  
+startMatch :: [Int] -> ([Player] -> ReaderT Env Handler Match) -> ReaderT Env Handler ReadyMatch
+startMatch players getMatchFromRequest = do
+  ps <- inPipe (readPlayers players)
   m <- getMatchFromRequest ps
   let h = getHandicap m
   return $ ReadyMatch m h
-  where
-    getPlayersFromRequest = case request of
-      (SinglesRequest p1 p2) -> [p1, p2]
-      (DoublesRequest (TeamReqest pa1 pa2) (TeamReqest pb1 pb2)) -> [pa1, pa2, pb1, pb2]
-      (MixedRequest (TeamReqest pa1 pa2) (TeamReqest pb1 pb2)) -> [pa1, pa2, pb1, pb2]
-
-    getMatchFromRequest ps = case (request, ps) of
-      (SinglesRequest _ _, [p1, p2]) -> pure $ Singles p1 p2
-      (DoublesRequest _ _, [p1, p2, p3, p4]) -> pure $ Doubles (p1, p2) (p3, p4)
-      (MixedRequest _ _, [p1, p2, p3, p4]) -> pure $ Mixed (p1, p2) (p3, p4)
-      _ -> throwError err500
 
 inPipe :: (Pipe -> IO a) -> AppHandler a
 inPipe a = ask >>= \e -> liftIO $ withDb e a
@@ -114,13 +127,17 @@ instance ToJSON ReadyMatch
 
 instance FromJSON ReadyMatch
 
-instance ToJSON StartMatchRequest
+instance ToJSON DoublesRequest
 
-instance FromJSON StartMatchRequest
+instance FromJSON DoublesRequest
 
-instance ToJSON TeamReqest
+instance ToJSON MixedRequest
 
-instance FromJSON TeamReqest
+instance FromJSON MixedRequest
+
+instance ToJSON SinglesRequest
+
+instance FromJSON SinglesRequest
 
 -- * Swagger
 
@@ -132,10 +149,15 @@ instance ToSchema Match
 
 instance ToSchema ReadyMatch
 
-instance ToSchema StartMatchRequest
-
-instance ToSchema TeamReqest
+instance ToSchema SinglesRequest
 
 swaggerDoc :: Swagger
 swaggerDoc =
-  toSwagger (Proxy :: Proxy RestApi)
+  toSwagger (Proxy :: Proxy Api)
+
+
+
+-- data Test = Test Int Int
+-- {
+--    ""
+-- }
